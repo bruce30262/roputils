@@ -677,6 +677,7 @@ class ROP_X86_64(ROP):
             return re.compile('(?:' + '|'.join(map(re.escape, args)) + ')')
 
         table = {
+            'pop_rsi_r15': '\x5e\x41\x5f\xc3',
             'leave': '\xc9\xc3',
             'ret': '\xc3',
             'int3': '\xcc',
@@ -753,6 +754,13 @@ class ROP_X86_64(ROP):
         regs = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
         buf = ''
         for i, arg in enumerate(args):
+            if regs[i] == 'rsi':
+                try:
+                    buf += self.p([self.gadget('pop', regs[i]), arg])
+                    continue
+                except ValueError:
+                    buf += self.p([self.gadget('pop_rsi_r15'), arg, 0])
+                    continue
             buf += self.p([self.gadget('pop', regs[i]), arg])
         buf += self.p(addr)
         buf += self.p(args[6:])
